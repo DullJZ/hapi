@@ -281,28 +281,28 @@ class OpencodeStorageScanner {
             const query = this.db.prepare(`
                 SELECT id, directory, time_created
                 FROM session
-                WHERE directory = ?
+                WHERE time_created >= ?
+                  AND time_created <= ?
                 ORDER BY time_created DESC
                 LIMIT 10
             `);
-            const rows = query.all(this.targetCwd) as DbSessionRow[];
+            const rows = query.all(
+                this.referenceTimestampMs,
+                this.referenceTimestampMs + this.sessionStartWindowMs
+            ) as DbSessionRow[];
 
             let best: SessionCandidate | null = null;
 
             for (const row of rows) {
-                if (!row.id || row.time_created === null) {
+                if (!row.id || !row.directory || row.time_created === null) {
                     continue;
                 }
 
-                if (row.time_created < this.referenceTimestampMs) {
+                if (normalizePath(row.directory) !== this.targetCwd) {
                     continue;
                 }
 
                 const diff = row.time_created - this.referenceTimestampMs;
-                if (diff > this.sessionStartWindowMs) {
-                    continue;
-                }
-
                 if (!best || diff < best.score) {
                     best = { sessionId: row.id, score: diff, source: 'database' };
                 }
@@ -453,6 +453,7 @@ class OpencodeStorageScanner {
             const messages = messageQuery.all(sessionId) as DbMessageRow[];
             const replayThresholdMs = this.referenceTimestampMs - REPLAY_CLOCK_SKEW_MS;
             const messageIds: string[] = [];
+            const replayMessageIds = new Set<string>();
 
             for (const msg of messages) {
                 if (msg.id) {
@@ -470,6 +471,7 @@ class OpencodeStorageScanner {
                             if (role) {
                                 this.messageRoles.set(msg.id, role);
                             }
+                            replayMessageIds.add(msg.id);
                             this.onEvent({
                                 event: 'message.updated',
                                 payload: { info },
@@ -494,6 +496,9 @@ class OpencodeStorageScanner {
 
                 for (const partRow of parts) {
                     this.partDbVersion.set(partRow.id, partRow.time_updated);
+                    if (!replayMessageIds.has(messageId)) {
+                        continue;
+                    }
 
                     try {
                         const part = {
