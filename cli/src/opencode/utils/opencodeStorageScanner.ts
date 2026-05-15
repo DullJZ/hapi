@@ -283,8 +283,7 @@ class OpencodeStorageScanner {
                 FROM session
                 WHERE time_created >= ?
                   AND time_created <= ?
-                ORDER BY time_created DESC
-                LIMIT 10
+                ORDER BY time_created ASC
             `);
             const rows = query.all(
                 this.referenceTimestampMs,
