@@ -24,9 +24,12 @@ type OpencodeStorageScannerOptions = {
     startupTimestampMs?: number;
 };
 
+type StorageSource = 'database' | 'files';
+
 type SessionCandidate = {
     sessionId: string;
     score: number;
+    source: StorageSource;
 };
 
 type DbSessionRow = {
@@ -88,7 +91,7 @@ class OpencodeStorageScanner {
 
     private intervalId: ReturnType<typeof setInterval> | null = null;
     private activeSessionId: string | null = null;
-    private activeStorageSource: 'database' | 'files' | null = null;
+    private activeStorageSource: StorageSource | null = null;
     private matchFailed = false;
     private warnedMissingStorage = false;
     private scanning = false;
@@ -111,7 +114,6 @@ class OpencodeStorageScanner {
         this.matchDeadlineMs = this.referenceTimestampMs + this.sessionStartWindowMs;
         this.intervalMs = opts.intervalMs ?? DEFAULT_SCAN_INTERVAL_MS;
         this.seedSessionId = opts.sessionId;
-        this.activeSessionId = opts.sessionId;
 
         if (!this.targetCwd && !this.seedSessionId) {
             const message = 'No cwd/sessionId available for OpenCode storage matching; scanner disabled.';
@@ -258,7 +260,7 @@ class OpencodeStorageScanner {
         }
 
         if (best) {
-            await this.setActiveSession(best.sessionId);
+            await this.setActiveSession(best.sessionId, best.source);
             return;
         }
 
@@ -302,7 +304,7 @@ class OpencodeStorageScanner {
                 }
 
                 if (!best || diff < best.score) {
-                    best = { sessionId: row.id, score: diff };
+                    best = { sessionId: row.id, score: diff, source: 'database' };
                 }
             }
 
@@ -341,7 +343,7 @@ class OpencodeStorageScanner {
             }
 
             if (!best || diff < best.score) {
-                best = { sessionId: info.id, score: diff };
+                best = { sessionId: info.id, score: diff, source: 'files' };
             }
         }
 
@@ -352,8 +354,8 @@ class OpencodeStorageScanner {
         return best;
     }
 
-    private async setActiveSession(sessionId: string): Promise<void> {
-        if (this.activeSessionId === sessionId) {
+    private async setActiveSession(sessionId: string, source?: StorageSource): Promise<void> {
+        if (this.activeSessionId === sessionId && (!source || this.activeStorageSource === source)) {
             return;
         }
         this.activeSessionId = sessionId;
@@ -362,8 +364,9 @@ class OpencodeStorageScanner {
         this.partDbVersion.clear();
         this.activeStorageSource = null;
 
-        // Try database-based priming first
-        if (this.dbReady && this.db) {
+        const storageSource = source ?? await this.resolveStorageSourceForSession(sessionId);
+
+        if (storageSource === 'database' && this.dbReady && this.db) {
             try {
                 await this.primeSessionFilesFromDatabase(sessionId);
                 this.activeStorageSource = 'database';
@@ -373,7 +376,6 @@ class OpencodeStorageScanner {
             }
         }
 
-        // Fall back to file-based priming if database failed or unavailable
         if (!this.activeStorageSource && await this.ensureStorageDir()) {
             await this.primeSessionFilesFromFiles(sessionId);
             this.activeStorageSource = 'files';
@@ -381,6 +383,59 @@ class OpencodeStorageScanner {
 
         this.onSessionFound?.(sessionId);
         logger.debug(`[opencode-storage] Tracking session ${sessionId} (source: ${this.activeStorageSource})`);
+    }
+
+    private async resolveStorageSourceForSession(sessionId: string): Promise<StorageSource | null> {
+        if (this.dbReady && this.db && this.databaseHasSession(sessionId)) {
+            return 'database';
+        }
+        if (await this.sessionFilesExist(sessionId)) {
+            return 'files';
+        }
+        if (this.dbReady && this.db) {
+            return 'database';
+        }
+        if (await this.ensureStorageDir()) {
+            return 'files';
+        }
+        return null;
+    }
+
+    private databaseHasSession(sessionId: string): boolean {
+        if (!this.db) {
+            return false;
+        }
+
+        try {
+            const query = this.db.prepare(`
+                SELECT 1
+                FROM session
+                WHERE id = ?
+                LIMIT 1
+            `);
+            return Boolean(query.get(sessionId));
+        } catch (error) {
+            logger.debug(`[opencode-storage] Database session lookup failed: ${error}`);
+            return false;
+        }
+    }
+
+    private async sessionFilesExist(sessionId: string): Promise<boolean> {
+        const messageDir = join(this.storageDir, 'message', sessionId);
+        const messageFiles = await listJsonFiles(messageDir);
+        if (messageFiles.length > 0) {
+            return true;
+        }
+
+        const sessionFiles = await listSessionInfoFiles(this.storageDir);
+        for (const filePath of sessionFiles) {
+            const info = await readSessionInfo(filePath);
+            if (info?.id === sessionId) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private async primeSessionFilesFromDatabase(sessionId: string): Promise<void> {
